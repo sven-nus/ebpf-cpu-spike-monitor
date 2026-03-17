@@ -1,0 +1,15 @@
+[Unit]
+Description=eBPF CPU Spike Monitor
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ebpf-cpu-spike-monitor.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ebpf-cpu-spike-monitor
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+# Kiro IDE
+.kiro/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+/tmp/
+*.tmp
+*.swp
+*.swo
+*~
+
+# Reports (generated at runtime)
+/ebpf_reports/

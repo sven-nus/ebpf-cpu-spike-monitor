@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ebpf-cpu-spike-monitor
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: ebpf-cpu-spike-monitor
+  template:
+    metadata:
+      labels:
+        app: ebpf-cpu-spike-monitor
+    spec:
+      hostPID: true
+      containers:
+      - name: monitor
+        image: rockylinux:9
+        command: ["/bin/bash", "/scripts/ebpf-cpu-spike-monitor.sh"]
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        - name: reports
+          mountPath: /tmp/ebpf_reports
+        - name: debugfs
+          mountPath: /sys/kernel/debug
+        - name: sys-class-net
+          mountPath: /sys/class/net
+          readOnly: true
+      volumes:
+      - name: scripts
+        configMap:
+          name: ebpf-cpu-spike-monitor-script
+          defaultMode: 0755
+      - name: reports
+        hostPath:
+          path: /tmp/ebpf_reports
+          type: DirectoryOrCreate
+      - name: debugfs
+        hostPath:
+          path: /sys/kernel/debug
+      - name: sys-class-net
+        hostPath:
+          path: /sys/class/net
