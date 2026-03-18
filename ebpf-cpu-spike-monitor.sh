@@ -863,9 +863,11 @@ EOF
     log_info "采样窗口结束，总采样时长: ${sampling_duration}s"
 
     # 6. 终止 bpftrace
+    # 必须使用 SIGINT 而非 SIGTERM：bpftrace 只在收到 SIGINT 时执行 END 块，
+    # 输出聚合的堆栈统计数据。SIGTERM 会直接终止进程，导致输出文件为空。
     if [[ -n "$BPFTRACE_PID" ]] && kill -0 "$BPFTRACE_PID" 2>/dev/null; then
         log_info "终止 bpftrace (PID=$BPFTRACE_PID)"
-        kill "$BPFTRACE_PID" 2>/dev/null || true
+        kill -SIGINT "$BPFTRACE_PID" 2>/dev/null || true
         wait "$BPFTRACE_PID" 2>/dev/null || true
         BPFTRACE_PID=""
     else
@@ -2721,7 +2723,7 @@ enforce_retention() {
 #   通过 kill + wait 确保采样进行中收到信号时等待子进程结束后再退出。
 cleanup() {
     log_info "收到终止信号，正在清理..."
-    [ -n "$BPFTRACE_PID" ] && kill "$BPFTRACE_PID" 2>/dev/null && wait "$BPFTRACE_PID" 2>/dev/null
+    [ -n "$BPFTRACE_PID" ] && kill -SIGINT "$BPFTRACE_PID" 2>/dev/null && wait "$BPFTRACE_PID" 2>/dev/null
     [ -n "$ATOP_PID" ] && kill "$ATOP_PID" 2>/dev/null && wait "$ATOP_PID" 2>/dev/null
     [ -n "$ENA_COLLECTOR_PID" ] && kill "$ENA_COLLECTOR_PID" 2>/dev/null && wait "$ENA_COLLECTOR_PID" 2>/dev/null
     [ -d "$CURRENT_SAMPLING_DIR" ] && rm -rf "$CURRENT_SAMPLING_DIR"
