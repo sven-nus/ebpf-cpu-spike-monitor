@@ -84,7 +84,7 @@ log_error() {
 # ============================================================================
 
 _bpftrace() {
-    bpftrace "$@"
+    exec bpftrace "$@"
 }
 
 _atop() {
@@ -511,9 +511,10 @@ get_process_cpu() {
     local num_cpus
     num_cpus=$(_get_num_cpus)
 
-    # CPU% = (delta_process / delta_total) * num_cpus * 100
+    # CPU% = (delta_process * num_cpus * 100) / delta_total
+    # Note: multiply before divide to avoid bc integer division truncation
     local cpu_pct
-    cpu_pct=$(echo "scale=1; ($delta_process / $delta_total) * $num_cpus * 100" | _bc -l)
+    cpu_pct=$(echo "scale=1; ($delta_process * $num_cpus * 100) / $delta_total" | _bc -l)
     echo "$cpu_pct"
     return 0
 }
