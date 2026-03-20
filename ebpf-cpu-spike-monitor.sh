@@ -3,8 +3,8 @@
 # ebpf-cpu-spike-monitor.sh — eBPF CPU 尖峰自动监控与分析工具
 #
 # 通过 bpftrace 持续监控目标进程 CPU 使用率，在检测到归一化 CPU 超过阈值时
-# 自动触发 eBPF 堆栈采样、atop 系统采集、ENA 网络指标采集和 Valkey/Predixy
-# 运行时指标采集，生成结构化纯文本分析报告。
+# 自动触发 eBPF 堆栈采样、atop 系统采集、ENA 网络指标采集，
+# 生成结构化纯文本分析报告。
 #
 
 set -euo pipefail
@@ -20,7 +20,7 @@ COOLDOWN_PERIOD=30              # 冷却期 (秒)
 
 # === 目标进程配置 ===
 # 格式: "进程名:vCPU数"
-TARGET_PROCS=("valkey-server:1" "predixy:4")
+TARGET_PROCS=("my-server:1")
 
 # === 采样参数 ===
 SAMPLE_FREQ=99                  # bpftrace 采样频率 (Hz)
@@ -36,12 +36,6 @@ MAX_RETENTION_DAYS=7            # 最大保留天数
 MAX_DIR_SIZE_MB=500             # 目录大小上限 (MB)
 MIN_DISK_FREE_MB=1024           # 最小磁盘剩余 (MB)
 RETENTION_HOT_HOURS=24          # 热保留期 (小时)
-
-# === 应用连接信息 ===
-VALKEY_HOST="127.0.0.1"
-VALKEY_PORT=6379
-PREDIXY_HOST="127.0.0.1"
-PREDIXY_PORT=7617
 
 # ============================================================================
 # 进程配置 — 关联数组
@@ -97,14 +91,6 @@ _mpstat() {
 
 _ethtool() {
     ethtool "$@"
-}
-
-_valkey_cli() {
-    valkey-cli "$@"
-}
-
-_redis_cli() {
-    redis-cli "$@"
 }
 
 _bc() {
@@ -300,28 +286,6 @@ generate_dependency_report() {
             echo "[✗] ethtool     — 未安装，ENA 网络指标不可用"
         fi
 
-        # valkey-cli + 连接测试
-        if command -v valkey-cli &>/dev/null; then
-            if timeout 2 valkey-cli -h "$VALKEY_HOST" -p "$VALKEY_PORT" PING 2>/dev/null | grep -q PONG; then
-                echo "[✓] valkey-cli  — 连接 ${VALKEY_HOST}:${VALKEY_PORT} 成功"
-            else
-                echo "[△] valkey-cli  — 已安装，连接 ${VALKEY_HOST}:${VALKEY_PORT} 失败"
-            fi
-        else
-            echo "[✗] valkey-cli  — 未安装，Valkey 指标/配置不可用"
-        fi
-
-        # redis-cli + 连接测试
-        if command -v redis-cli &>/dev/null; then
-            if timeout 2 redis-cli -h "$PREDIXY_HOST" -p "$PREDIXY_PORT" PING 2>/dev/null | grep -q PONG; then
-                echo "[✓] redis-cli   — 连接 ${PREDIXY_HOST}:${PREDIXY_PORT} 成功"
-            else
-                echo "[△] redis-cli   — 已安装，连接 ${PREDIXY_HOST}:${PREDIXY_PORT} 失败"
-            fi
-        else
-            echo "[✗] redis-cli   — 未安装，Predixy 指标不可用"
-        fi
-
         # numactl
         command -v numactl &>/dev/null \
             && echo "[✓] numactl     — 已安装" \
@@ -343,12 +307,6 @@ generate_dependency_report() {
         command -v ethtool &>/dev/null \
             && echo "ENA 网络指标:                           ✓ 可用" \
             || echo "ENA 网络指标:                           ✗ 不可用"
-        command -v valkey-cli &>/dev/null \
-            && echo "Valkey 指标/配置:                       ✓ 可用" \
-            || echo "Valkey 指标/配置:                       ✗ 不可用"
-        command -v redis-cli &>/dev/null \
-            && echo "Predixy 指标:                           ✓ 可用" \
-            || echo "Predixy 指标:                           ✗ 不可用"
         echo ""
         echo "图例: [✓] 可用  [△] 部分可用  [✗] 不可用"
         echo "========================================"
@@ -397,8 +355,6 @@ check_and_install_dependencies() {
     fi
 
     # 可选依赖缺失告警（不影响继续运行）
-    command -v valkey-cli &>/dev/null || log_warn "可选依赖缺失: valkey-cli — Valkey 指标/配置采集不可用"
-    command -v redis-cli &>/dev/null  || log_warn "可选依赖缺失: redis-cli — Predixy 指标采集不可用"
     command -v ethtool &>/dev/null    || log_warn "可选依赖缺失: ethtool — ENA 网络指标采集不可用"
     command -v numactl &>/dev/null    || log_warn "可选依赖缺失: numactl — NUMA 拓扑信息不可用"
     command -v iostat &>/dev/null     || log_warn "可选依赖缺失: iostat — 磁盘 I/O 快照不可用"
@@ -853,9 +809,7 @@ EOF
     ENA_COLLECTOR_PID=$!
     log_info "ENA 指标采集已启动 (PID=$ENA_COLLECTOR_PID)"
 
-    # collect_valkey_info / collect_predixy_info / collect_dynamic_sysinfo (Task 7.1)
-    collect_valkey_info "$sampling_dir" || log_warn "Valkey 指标采集失败"
-    collect_predixy_info "$sampling_dir" || log_warn "Predixy 指标采集失败"
+    # collect_dynamic_sysinfo (Task 7.1)
     collect_dynamic_sysinfo "$sampling_dir" || log_warn "动态系统信息采集失败"
 
     # 5. 控制动态采样窗口
@@ -1040,92 +994,6 @@ collect_ec2_metadata() {
     return 0
 }
 
-# collect_valkey_config
-#   通过 valkey-cli CONFIG GET 采集 Valkey 关键配置项
-#   直接写入 stdout
-#   返回: 0
-collect_valkey_config() {
-    echo "=== Valkey 配置 ==="
-
-    # valkey-cli 不可用时标注
-    if ! command -v valkey-cli &>/dev/null; then
-        echo "Valkey 配置: 不可用 (valkey-cli 未安装)"
-        echo ""
-        return 0
-    fi
-
-    # 需要采集的配置项列表
-    local config_keys=(
-        io-threads
-        io-threads-do-reads
-        maxmemory
-        maxmemory-policy
-        save
-        appendonly
-        appendfsync
-        hz
-        tcp-backlog
-        timeout
-        cluster-enabled
-    )
-
-    # 测试连接
-    if ! timeout 2 _valkey_cli -h "$VALKEY_HOST" -p "$VALKEY_PORT" PING &>/dev/null; then
-        echo "Valkey 配置: 不可用 (连接 ${VALKEY_HOST}:${VALKEY_PORT} 失败)"
-        echo ""
-        return 0
-    fi
-
-    local key value
-    for key in "${config_keys[@]}"; do
-        value=$(timeout 2 _valkey_cli -h "$VALKEY_HOST" -p "$VALKEY_PORT" CONFIG GET "$key" 2>/dev/null | tail -1)
-        if [[ -n "$value" ]]; then
-            printf "%-25s %s\n" "${key}:" "$value"
-        else
-            printf "%-25s %s\n" "${key}:" "N/A"
-        fi
-    done
-    echo ""
-
-    return 0
-}
-
-# collect_predixy_config
-#   采集 Predixy 配置信息（通过 redis-cli INFO 获取）
-#   直接写入 stdout
-#   返回: 0
-collect_predixy_config() {
-    echo "=== Predixy 配置 ==="
-
-    # redis-cli 不可用时标注
-    if ! command -v redis-cli &>/dev/null; then
-        echo "Predixy 配置: 不可用 (redis-cli 未安装)"
-        echo ""
-        return 0
-    fi
-
-    # 通过 redis-cli INFO 获取 Predixy 配置信息
-    local raw_info
-    raw_info=$(timeout 2 _redis_cli -h "$PREDIXY_HOST" -p "$PREDIXY_PORT" INFO 2>&1)
-    local rc=$?
-
-    if [[ $rc -ne 0 ]]; then
-        local err_msg
-        if [[ $rc -eq 124 ]]; then
-            err_msg="连接超时 (2s)"
-        else
-            err_msg=$(echo "$raw_info" | head -1)
-        fi
-        echo "Predixy 配置: 不可用 (连接失败: ${err_msg})"
-        echo ""
-        return 0
-    fi
-
-    echo "$raw_info"
-    echo ""
-
-    return 0
-}
 
 # collect_ena_baseline
 #   采集 ENA 驱动版本和基线计数器
@@ -1246,12 +1114,6 @@ collect_baseline() {
         # ENA 网络信息
         collect_ena_baseline 2>/dev/null || echo "[采集 ENA 基线信息时发生错误]"
 
-        # Valkey 配置
-        collect_valkey_config 2>/dev/null || echo "[采集 Valkey 配置时发生错误]"
-
-        # Predixy 配置
-        collect_predixy_config 2>/dev/null || echo "[采集 Predixy 配置时发生错误]"
-
         echo "================================================================================"
         echo "基线信息结束"
         echo "================================================================================"
@@ -1333,7 +1195,7 @@ get_top_functions() {
 
     # 解析每个堆栈条目，提取函数名并关联 count
     # 堆栈格式:
-    # @cpu_stack[valkey-server,
+    # @cpu_stack[my-server,
     # kstack_func1
     # kstack_func2
     # ,
@@ -1404,467 +1266,6 @@ get_top_functions() {
     return 0
 }
 
-# analyze_valkey_stacks STACK_DATA_FILE
-#   对 valkey-server comm 的 eBPF 堆栈数据执行根因模式匹配
-#   实现 6 种 Valkey 根因模式识别，未匹配时输出 Top 5 热点函数
-#   参数: $1 = bpftrace 输出文件路径
-#   输出: 分析结果文本到 stdout
-#   返回: 0
-analyze_valkey_stacks() {
-    local stack_data_file="$1"
-
-    if [[ ! -r "$stack_data_file" ]]; then
-        echo "Valkey 堆栈分析: 不可用 (数据文件不可读: $stack_data_file)"
-        return 0
-    fi
-
-    # 读取文件内容
-    local full_data
-    full_data=$(cat "$stack_data_file")
-
-    # 过滤 valkey-server comm 的堆栈条目
-    # bpftrace 输出格式:
-    # @cpu_stack[valkey-server,
-    # kstack
-    # ,
-    # ustack
-    # ]: count
-    local valkey_data
-    valkey_data=$(echo "$full_data" | awk '
-    BEGIN { in_entry = 0; entry = ""; is_valkey = 0 }
-    /^@cpu_stack\[/ {
-        in_entry = 1
-        entry = $0
-        # Check if this entry is for valkey-server
-        is_valkey = ($0 ~ /valkey-server/) ? 1 : 0
-        next
-    }
-    in_entry {
-        entry = entry "\n" $0
-        if ($0 ~ /\]: [0-9]+$/) {
-            if (is_valkey) {
-                print entry
-            }
-            in_entry = 0
-            entry = ""
-            is_valkey = 0
-        }
-    }
-    ')
-
-    if [[ -z "$valkey_data" ]]; then
-        echo "Valkey 堆栈分析: 未检测到 valkey-server 堆栈数据"
-        return 0
-    fi
-
-    echo "--- Valkey 根因分析 ---"
-
-    local matched=false
-
-    # === 模式 1: 单线程事件循环瓶颈 ===
-    # 条件: aeMain 或 aeApiPoll 采样占比 > 80%
-    local ae_main_pct ae_api_poll_pct
-    ae_main_pct=$(calc_stack_percentage "aeMain" "$valkey_data")
-    ae_api_poll_pct=$(calc_stack_percentage "aeApiPoll" "$valkey_data")
-
-    # 取两者中较大值判断
-    local ae_max_pct
-    ae_max_pct=$(echo "$ae_main_pct" "$ae_api_poll_pct" | awk '{if ($1 > $2) print $1; else print $2}')
-
-    local ae_above_80
-    ae_above_80=$(echo "$ae_max_pct > 80" | _bc -l)
-    if [[ "$ae_above_80" -eq 1 ]]; then
-        matched=true
-        echo "[模式] 单线程事件循环瓶颈"
-        echo "[特征函数] aeMain (采样占比: ${ae_main_pct}%), aeApiPoll (采样占比: ${ae_api_poll_pct}%)"
-        echo "[建议] 启用 io-threads 配置以分散 I/O 处理负载"
-        echo ""
-    fi
-
-    # === 模式 2: fork 操作尖峰 ===
-    # 条件: 出现 fork / copy_page_range / copy_pte_range 即匹配
-    local fork_funcs=()
-    local fork_pct
-    for fname in fork copy_page_range copy_pte_range; do
-        fork_pct=$(calc_stack_percentage "$fname" "$valkey_data")
-        local fork_present
-        fork_present=$(echo "$fork_pct > 0" | _bc -l)
-        if [[ "$fork_present" -eq 1 ]]; then
-            fork_funcs+=("${fname} (${fork_pct}%)")
-        fi
-    done
-
-    if [[ ${#fork_funcs[@]} -gt 0 ]]; then
-        matched=true
-        echo "[模式] fork 操作导致的尖峰"
-        echo "[特征函数] ${fork_funcs[*]}"
-        echo "[建议] 检查 BGSAVE 和 BGREWRITEAOF 的调度配置, 检查 Transparent Huge Pages 设置"
-        echo ""
-    fi
-
-    # === 模式 3: 慢命令阻塞 ===
-    # 条件: 出现 sortCommand / keysCommand / lremCommand / sunionCommand 即匹配
-    local slow_funcs=()
-    local slow_pct
-    for fname in sortCommand keysCommand lremCommand sunionCommand; do
-        slow_pct=$(calc_stack_percentage "$fname" "$valkey_data")
-        local slow_present
-        slow_present=$(echo "$slow_pct > 0" | _bc -l)
-        if [[ "$slow_present" -eq 1 ]]; then
-            slow_funcs+=("${fname} (${slow_pct}%)")
-        fi
-    done
-
-    if [[ ${#slow_funcs[@]} -gt 0 ]]; then
-        matched=true
-        echo "[模式] 慢命令阻塞事件循环"
-        echo "[特征函数] ${slow_funcs[*]}"
-        echo "[建议] 使用 SCAN 系列命令替代全量遍历操作"
-        echo ""
-    fi
-
-    # === 模式 4: 内存分配热点 ===
-    # 条件: 同时出现 (do_anonymous_page 或 handle_mm_fault) AND (dictAddRaw 或 zmalloc)
-    local has_kernel_alloc=false
-    local has_valkey_alloc=false
-    local mem_funcs=()
-
-    for fname in do_anonymous_page handle_mm_fault; do
-        local mem_pct
-        mem_pct=$(calc_stack_percentage "$fname" "$valkey_data")
-        local mem_present
-        mem_present=$(echo "$mem_pct > 0" | _bc -l)
-        if [[ "$mem_present" -eq 1 ]]; then
-            has_kernel_alloc=true
-            mem_funcs+=("${fname} (${mem_pct}%)")
-        fi
-    done
-
-    for fname in dictAddRaw zmalloc; do
-        local mem_pct
-        mem_pct=$(calc_stack_percentage "$fname" "$valkey_data")
-        local mem_present
-        mem_present=$(echo "$mem_pct > 0" | _bc -l)
-        if [[ "$mem_present" -eq 1 ]]; then
-            has_valkey_alloc=true
-            mem_funcs+=("${fname} (${mem_pct}%)")
-        fi
-    done
-
-    if $has_kernel_alloc && $has_valkey_alloc; then
-        matched=true
-        echo "[模式] 内存分配热点"
-        echo "[特征函数] ${mem_funcs[*]}"
-        echo "[建议] 调整内存分配器配置或启用 Huge Pages"
-        echo ""
-    fi
-
-    # === 模式 5: key 过期清理风暴 ===
-    # 条件: 出现 activeExpireCycle 即匹配
-    local expire_pct
-    expire_pct=$(calc_stack_percentage "activeExpireCycle" "$valkey_data")
-    local expire_present
-    expire_present=$(echo "$expire_pct > 0" | _bc -l)
-    if [[ "$expire_present" -eq 1 ]]; then
-        matched=true
-        echo "[模式] key 过期清理风暴"
-        echo "[特征函数] activeExpireCycle (采样占比: ${expire_pct}%)"
-        echo "[建议] 分散 key 的过期时间以避免集中过期"
-        echo ""
-    fi
-
-    # === 模式 6: AOF 写入延迟 ===
-    # 条件: 同时出现 (fdatasync 或 write) AND AOF 相关函数
-    local has_io_func=false
-    local has_aof_func=false
-    local aof_funcs=()
-
-    for fname in fdatasync write; do
-        local aof_pct
-        aof_pct=$(calc_stack_percentage "$fname" "$valkey_data")
-        local aof_present
-        aof_present=$(echo "$aof_pct > 0" | _bc -l)
-        if [[ "$aof_present" -eq 1 ]]; then
-            has_io_func=true
-            aof_funcs+=("${fname} (${aof_pct}%)")
-        fi
-    done
-
-    for fname in flushAppendOnlyFile aofWrite aofRewriteBufferAppend feedAppendOnlyFile; do
-        local aof_pct
-        aof_pct=$(calc_stack_percentage "$fname" "$valkey_data")
-        local aof_present
-        aof_present=$(echo "$aof_pct > 0" | _bc -l)
-        if [[ "$aof_present" -eq 1 ]]; then
-            has_aof_func=true
-            aof_funcs+=("${fname} (${aof_pct}%)")
-        fi
-    done
-
-    if $has_io_func && $has_aof_func; then
-        matched=true
-        echo "[模式] AOF 写入延迟"
-        echo "[特征函数] ${aof_funcs[*]}"
-        echo "[建议] 调整 appendfsync 配置为 everysec"
-        echo ""
-    fi
-
-    # === 未匹配任何模式 ===
-    if ! $matched; then
-        echo "未识别到已知 Valkey 性能模式"
-        echo "Top 5 热点函数:"
-        local top_output
-        top_output=$(get_top_functions "$valkey_data" 5)
-        if [[ -n "$top_output" ]]; then
-            local rank=0
-            while IFS= read -r line; do
-                rank=$(( rank + 1 ))
-                local count func pct
-                count=$(echo "$line" | awk '{print $1}')
-                func=$(echo "$line" | awk '{print $2}')
-                pct=$(echo "$line" | awk '{print $3}')
-                echo "  ${rank}. ${func} (采样: ${count}, 占比: ${pct})"
-            done <<< "$top_output"
-        else
-            echo "  (无堆栈数据)"
-        fi
-        echo ""
-    fi
-
-    return 0
-}
-
-# analyze_predixy_stacks STACK_DATA_FILE
-#   对 predixy comm 的 eBPF 堆栈数据执行根因模式匹配
-#   实现 4 种 Predixy 根因模式识别，未匹配时输出 Top 5 热点函数
-#   参数: $1 = bpftrace 输出文件路径
-#   输出: 分析结果文本到 stdout
-#   返回: 0
-analyze_predixy_stacks() {
-    local stack_data_file="$1"
-
-    if [[ ! -r "$stack_data_file" ]]; then
-        echo "Predixy 堆栈分析: 不可用 (数据文件不可读: $stack_data_file)"
-        return 0
-    fi
-
-    # 读取文件内容
-    local full_data
-    full_data=$(cat "$stack_data_file")
-
-    # 过滤 predixy comm 的堆栈条目
-    local predixy_data
-    predixy_data=$(echo "$full_data" | awk '
-    BEGIN { in_entry = 0; entry = ""; is_predixy = 0 }
-    /^@cpu_stack\[/ {
-        in_entry = 1
-        entry = $0
-        is_predixy = ($0 ~ /predixy/) ? 1 : 0
-        next
-    }
-    in_entry {
-        entry = entry "\n" $0
-        if ($0 ~ /\]: [0-9]+$/) {
-            if (is_predixy) {
-                print entry
-            }
-            in_entry = 0
-            entry = ""
-            is_predixy = 0
-        }
-    }
-    ')
-
-    if [[ -z "$predixy_data" ]]; then
-        echo "Predixy 堆栈分析: 未检测到 predixy 堆栈数据"
-        return 0
-    fi
-
-    echo "--- Predixy 根因分析 ---"
-
-    local matched=false
-
-    # === 模式 1: 连接池动态扩容 ===
-    # 条件: 同时出现 ConnectionPool::addConnection AND (malloc 或 operator new)
-    local has_conn_pool=false
-    local has_alloc=false
-    local conn_funcs=()
-
-    local conn_pct
-    conn_pct=$(calc_stack_percentage "ConnectionPool::addConnection" "$predixy_data")
-    local conn_present
-    conn_present=$(echo "$conn_pct > 0" | _bc -l)
-    if [[ "$conn_present" -eq 1 ]]; then
-        has_conn_pool=true
-        conn_funcs+=("ConnectionPool::addConnection (${conn_pct}%)")
-    fi
-
-    for fname in malloc "operator new"; do
-        local alloc_pct
-        alloc_pct=$(calc_stack_percentage "$fname" "$predixy_data")
-        local alloc_present
-        alloc_present=$(echo "$alloc_pct > 0" | _bc -l)
-        if [[ "$alloc_present" -eq 1 ]]; then
-            has_alloc=true
-            conn_funcs+=("${fname} (${alloc_pct}%)")
-        fi
-    done
-
-    if $has_conn_pool && $has_alloc; then
-        matched=true
-        echo "[模式] 连接池动态扩容"
-        echo "[特征函数] ${conn_funcs[*]}"
-        echo "[建议] 通过 InitPoolSize 配置预分配连接池以减少运行时动态扩容开销"
-        echo ""
-    fi
-
-    # === 模式 2: 内存分配热点 ===
-    # 条件: 同时出现 (je_arena_malloc 或 std::allocator) AND Request::parse
-    local has_jemalloc=false
-    local has_request_parse=false
-    local mem_funcs=()
-
-    for fname in je_arena_malloc "std::allocator"; do
-        local mem_pct
-        mem_pct=$(calc_stack_percentage "$fname" "$predixy_data")
-        local mem_present
-        mem_present=$(echo "$mem_pct > 0" | _bc -l)
-        if [[ "$mem_present" -eq 1 ]]; then
-            has_jemalloc=true
-            mem_funcs+=("${fname} (${mem_pct}%)")
-        fi
-    done
-
-    local req_pct
-    req_pct=$(calc_stack_percentage "Request::parse" "$predixy_data")
-    local req_present
-    req_present=$(echo "$req_pct > 0" | _bc -l)
-    if [[ "$req_present" -eq 1 ]]; then
-        has_request_parse=true
-        mem_funcs+=("Request::parse (${req_pct}%)")
-    fi
-
-    if $has_jemalloc && $has_request_parse; then
-        matched=true
-        echo "[模式] 内存分配热点"
-        echo "[特征函数] ${mem_funcs[*]}"
-        echo "[建议] 调整 jemalloc 参数 (background_thread, dirty_decay_ms) 以优化内存分配性能"
-        echo ""
-    fi
-
-    # === 模式 3: 多线程锁竞争 ===
-    # 条件: 出现 pthread_mutex_lock 或 futex_wait 即匹配
-    local lock_funcs=()
-
-    for fname in pthread_mutex_lock futex_wait; do
-        local lock_pct
-        lock_pct=$(calc_stack_percentage "$fname" "$predixy_data")
-        local lock_present
-        lock_present=$(echo "$lock_pct > 0" | _bc -l)
-        if [[ "$lock_present" -eq 1 ]]; then
-            lock_funcs+=("${fname} (${lock_pct}%)")
-        fi
-    done
-
-    if [[ ${#lock_funcs[@]} -gt 0 ]]; then
-        matched=true
-        echo "[模式] 多线程锁竞争"
-        echo "[特征函数] ${lock_funcs[*]}"
-        echo "[建议] 检查 Predixy 的 WorkerThreads 配置是否与 CPU 核心数匹配"
-        echo ""
-    fi
-
-    # === 模式 4: epoll 事件循环瓶颈 ===
-    # 条件: epoll_wait 采样占比 > 70%
-    local epoll_pct
-    epoll_pct=$(calc_stack_percentage "epoll_wait" "$predixy_data")
-    local epoll_above_70
-    epoll_above_70=$(echo "$epoll_pct > 70" | _bc -l)
-    if [[ "$epoll_above_70" -eq 1 ]]; then
-        matched=true
-        echo "[模式] epoll 事件循环瓶颈"
-        echo "[特征函数] epoll_wait (采样占比: ${epoll_pct}%)"
-        echo "[建议] 检查后端连接数配置和超时参数"
-        echo ""
-    fi
-
-    # === 未匹配任何模式 ===
-    if ! $matched; then
-        echo "未识别到已知 Predixy 性能模式"
-        echo "Top 5 热点函数:"
-        local top_output
-        top_output=$(get_top_functions "$predixy_data" 5)
-        if [[ -n "$top_output" ]]; then
-            local rank=0
-            while IFS= read -r line; do
-                rank=$(( rank + 1 ))
-                local count func pct
-                count=$(echo "$line" | awk '{print $1}')
-                func=$(echo "$line" | awk '{print $2}')
-                pct=$(echo "$line" | awk '{print $3}')
-                echo "  ${rank}. ${func} (采样: ${count}, 占比: ${pct})"
-            done <<< "$top_output"
-        else
-            echo "  (无堆栈数据)"
-        fi
-        echo ""
-    fi
-
-    return 0
-}
-
-# analyze_stacks STACK_DATA_FILE
-#   分析入口函数：根据堆栈数据中的 comm 字段分发到对应的分析器
-#   - 检测 valkey-server comm → 调用 analyze_valkey_stacks()
-#   - 检测 predixy comm → 调用 analyze_predixy_stacks()
-#   - 两者都未检测到 → 输出提示信息
-#   输出包裹在 "=== 智能分析 ===" section 中
-#   参数: $1 = bpftrace 输出文件路径
-#   输出: 完整分析文本到 stdout
-#   返回: 0
-analyze_stacks() {
-    local stack_data_file="$1"
-
-    echo "=== 智能分析 ==="
-
-    # 检查数据文件是否可读
-    if [[ ! -r "$stack_data_file" ]]; then
-        echo "堆栈分析: 不可用 (数据文件不可读: $stack_data_file)"
-        echo ""
-        return 0
-    fi
-
-    local data
-    data=$(cat "$stack_data_file" 2>/dev/null)
-
-    if [[ -z "$data" ]]; then
-        echo "堆栈分析: 不可用 (数据文件为空)"
-        echo ""
-        return 0
-    fi
-
-    local found_any=false
-
-    # 检查是否包含 valkey-server comm 条目
-    if echo "$data" | grep -q "valkey-server"; then
-        found_any=true
-        analyze_valkey_stacks "$stack_data_file"
-    fi
-
-    # 检查是否包含 predixy comm 条目
-    if echo "$data" | grep -q "predixy"; then
-        found_any=true
-        analyze_predixy_stacks "$stack_data_file"
-    fi
-
-    # 两者都未检测到
-    if ! $found_any; then
-        echo "未检测到目标进程堆栈数据"
-        echo ""
-    fi
-
-    return 0
-}
 
 # ============================================================================
 # 采集/报告占位函数（后续任务实现）
@@ -1928,116 +1329,6 @@ stop_atop() {
     return 0
 }
 
-# collect_valkey_info SAMPLING_DIR
-#   通过 valkey-cli INFO 采集 Valkey 运行时关键指标
-#   提取: latest_fork_usec, used_memory, used_memory_rss, connected_clients,
-#         instantaneous_ops_per_sec, keyspace_hits, keyspace_misses, expired_keys
-#   连接失败时记录错误日志并标注不可用
-#   参数: $1 = 采样目录路径
-#   返回: 0
-collect_valkey_info() {
-    local sampling_dir="$1"
-    local output_file="${sampling_dir}/valkey_info.txt"
-
-    # valkey-cli 不可用时优雅跳过
-    if ! command -v valkey-cli &>/dev/null; then
-        log_warn "valkey-cli 未安装，跳过 Valkey 指标采集"
-        echo "Valkey 指标: 不可用 (valkey-cli 未安装)" > "$output_file"
-        return 0
-    fi
-
-    # 执行 valkey-cli INFO，2 秒超时
-    local raw_info
-    raw_info=$(timeout 2 _valkey_cli -h "$VALKEY_HOST" -p "$VALKEY_PORT" INFO 2>&1)
-    local rc=$?
-
-    if [[ $rc -ne 0 ]]; then
-        local err_msg
-        if [[ $rc -eq 124 ]]; then
-            err_msg="连接超时 (2s)"
-        else
-            err_msg=$(echo "$raw_info" | head -1)
-        fi
-        log_error "Valkey INFO 采集失败: $err_msg"
-        echo "Valkey 指标: 不可用 (连接失败: ${err_msg})" > "$output_file"
-        return 0
-    fi
-
-    # 提取关键指标
-    local metrics_keys=(
-        latest_fork_usec
-        used_memory
-        used_memory_rss
-        connected_clients
-        instantaneous_ops_per_sec
-        keyspace_hits
-        keyspace_misses
-        expired_keys
-    )
-
-    {
-        echo "--- Valkey 指标 (${VALKEY_HOST}:${VALKEY_PORT}) ---"
-        echo "采集时间: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo ""
-        local key value
-        for key in "${metrics_keys[@]}"; do
-            value=$(echo "$raw_info" | grep -E "^${key}:" | cut -d: -f2 | tr -d '[:space:]')
-            if [[ -n "$value" ]]; then
-                printf "%-30s %s\n" "${key}:" "$value"
-            else
-                printf "%-30s %s\n" "${key}:" "N/A"
-            fi
-        done
-    } > "$output_file"
-
-    log_info "Valkey 指标已采集: $output_file"
-    return 0
-}
-
-# collect_predixy_info SAMPLING_DIR
-#   通过 redis-cli INFO 采集 Predixy 运行时指标
-#   连接失败时记录错误日志并标注不可用
-#   参数: $1 = 采样目录路径
-#   返回: 0
-collect_predixy_info() {
-    local sampling_dir="$1"
-    local output_file="${sampling_dir}/predixy_info.txt"
-
-    # redis-cli 不可用时优雅跳过
-    if ! command -v redis-cli &>/dev/null; then
-        log_warn "redis-cli 未安装，跳过 Predixy 指标采集"
-        echo "Predixy 指标: 不可用 (redis-cli 未安装)" > "$output_file"
-        return 0
-    fi
-
-    # 执行 redis-cli INFO，2 秒超时
-    local raw_info
-    raw_info=$(timeout 2 _redis_cli -h "$PREDIXY_HOST" -p "$PREDIXY_PORT" INFO 2>&1)
-    local rc=$?
-
-    if [[ $rc -ne 0 ]]; then
-        local err_msg
-        if [[ $rc -eq 124 ]]; then
-            err_msg="连接超时 (2s)"
-        else
-            err_msg=$(echo "$raw_info" | head -1)
-        fi
-        log_error "Predixy INFO 采集失败: $err_msg"
-        echo "Predixy 指标: 不可用 (连接失败: ${err_msg})" > "$output_file"
-        return 0
-    fi
-
-    # 写入完整 INFO 输出
-    {
-        echo "--- Predixy 指标 (${PREDIXY_HOST}:${PREDIXY_PORT}) ---"
-        echo "采集时间: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo ""
-        echo "$raw_info"
-    } > "$output_file"
-
-    log_info "Predixy 指标已采集: $output_file"
-    return 0
-}
 
 # collect_dynamic_sysinfo SAMPLING_DIR
 #   采集动态系统信息：uptime, free -m, iostat（如可用）, ss -s
@@ -2310,32 +1601,29 @@ generate_report() {
             echo "eBPF 堆栈数据: 不可用 (bpftrace 输出文件为空或不可读)"
         fi
 
-        # ===== 智能分析 =====
+        # ===== Top 热点函数 =====
         echo ""
-        if type -t analyze_stacks &>/dev/null; then
-            analyze_stacks "$bpftrace_file"
+        echo "=== Top 热点函数 ==="
+        if [[ -r "$bpftrace_file" ]] && [[ -s "$bpftrace_file" ]]; then
+            if type -t get_top_functions &>/dev/null; then
+                local top_output
+                top_output=$(get_top_functions "$(cat "$bpftrace_file")" 10)
+                if [[ -n "$top_output" ]]; then
+                    local rank=0
+                    while IFS= read -r line; do
+                        rank=$(( rank + 1 ))
+                        local count func pct
+                        count=$(echo "$line" | awk '{print $1}')
+                        func=$(echo "$line" | awk '{print $2}')
+                        pct=$(echo "$line" | awk '{print $3}')
+                        echo "  ${rank}. ${func} (采样: ${count}, 占比: ${pct})"
+                    done <<< "$top_output"
+                else
+                    echo "  (无堆栈数据)"
+                fi
+            fi
         else
-            echo "=== 智能分析 ==="
-            echo "智能分析: 不可用 (分析器未加载)"
-        fi
-
-        # ===== 运行时指标 =====
-        echo ""
-        echo "=== 运行时指标 ==="
-        # Valkey 指标
-        local valkey_file="${sampling_dir}/valkey_info.txt"
-        if [[ -r "$valkey_file" ]] && [[ -s "$valkey_file" ]]; then
-            cat "$valkey_file"
-        else
-            echo "Valkey 指标: 不可用 (数据文件为空或不可读)"
-        fi
-        echo ""
-        # Predixy 指标
-        local predixy_file="${sampling_dir}/predixy_info.txt"
-        if [[ -r "$predixy_file" ]] && [[ -s "$predixy_file" ]]; then
-            cat "$predixy_file"
-        else
-            echo "Predixy 指标: 不可用 (数据文件为空或不可读)"
+            echo "热点函数: 不可用 (bpftrace 输出文件为空或不可读)"
         fi
 
         # ===== ENA 网络指标 =====

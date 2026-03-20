@@ -34,7 +34,7 @@
 
 - ✅ ARM Graviton 实例 vCPU 负载不均衡
 - ✅ 间歇性 CPU 尖峰排查（难以复现）
-- ✅ 高性能服务性能调优（Redis/Valkey/Predixy）
+- ✅ 高性能服务性能调优
 - ✅ 生产环境性能分析（低开销要求）
 - ✅ 微服务容器化环境（K8s/ECS）
 
@@ -109,7 +109,7 @@ CPU:    20%  95%  18%   92%  15%   88%  22%
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │  profile:hz:99  (99Hz 频率采样)                       │   │
 │  │  ↓                                                     │   │
-│  │  过滤目标进程 (valkey-server, predixy)                │   │
+│  │  过滤目标进程 (可配置)                                │   │
 │  │  ↓                                                     │   │
 │  │  捕获堆栈:                                             │   │
 │  │    - kstack (内核态调用链)                            │   │
@@ -205,8 +205,8 @@ done
 
 **eBPF 程序:**
 ```c
-profile:hz:99 /comm == "valkey-server" || comm == "predixy"/ { 
-    @cpu_stack[comm, kstack, ustack] = count(); 
+profile:hz:99 /comm == "my-server"/ {
+    @cpu_stack[comm, kstack, ustack] = count();
 }
 END {
     print(@cpu_stack);
@@ -253,7 +253,7 @@ spike_20260302_091254.txt
 ```
 [Mon Mar 2 09:12:54 UTC 2026] 检测到 vCPU 尖峰: 95.96%, 开始采样 15s...
 
-@cpu_stack[valkey-server, 
+@cpu_stack[my-server, 
     ep_poll+848                    # 内核: epoll 等待
     do_epoll_wait+236
     __arm64_sys_epoll_pwait+124
@@ -350,7 +350,7 @@ Average:       1   12.34    0.00   1.23    0.00    0.00    0.43    0.00    0.00 
   │         │                                │
   │         │                                ├─ 过滤进程 ──→ 读取 comm
   │         │                                │                  │
-  │         │                                │ ←─ valkey-server ┤
+  │         │                                │ ←─ my-server ┤
   │         │                                │
   6-21s     │                                ├─ 采样堆栈 (15s)
   │         │                                │   ├─ 捕获 kstack
@@ -448,7 +448,7 @@ vim ebpf-monitor-improved.sh
 
 # 修改配置
 SPIKE_THRESHOLD=30              # CPU 增长阈值
-TARGET_PROCS=("valkey-server")  # 目标进程
+TARGET_PROCS=("my-server")      # 目标进程
 SAMPLE_DURATION=15              # 采样时长
 ```
 
@@ -675,7 +675,7 @@ chmod +x deploy-k8s-ebpf-grafana.sh
 ```
 [Mon Mar  2 09:12:54 UTC 2026] 检测到 vCPU 尖峰: 95.96%, 开始采样 15s...
 
-@cpu_stack[valkey-server, 
+@cpu_stack[my-server, 
     hrtimer_start_range_ns+220
     schedule_hrtimeout_range_clock+148
     ep_poll+848
@@ -695,7 +695,7 @@ chmod +x deploy-k8s-ebpf-grafana.sh
     _start+48
 ]: 1247
 
-@cpu_stack[valkey-server, 
+@cpu_stack[my-server, 
     folio_add_lru+100
     lru_cache_add_inactive_or_unevictable+40
     do_anonymous_page+684
@@ -719,7 +719,7 @@ Average:       0   95.96    0.00   3.04    0.00    0.00    1.00    0.00    0.00 
 Average:       1   12.34    0.00   1.23    0.00    0.00    0.43    0.00    0.00    0.00   86.00
 
 === 目标进程状态 ===
-PID 1234: 95.2 2.3 /usr/bin/valkey-server *:6379
+PID 1234: 95.2 2.3 /usr/bin/my-server *:6379
 ```
 
 ### 7.2 堆栈分析步骤
@@ -758,7 +758,7 @@ hrtimer_start_range_ns+220  ← 启动定时器
 _start+48                   ← 程序入口
 __libc_start_main+156       ← C 运行时初始化
 main+1188                   ← main 函数
-aeMain+564                  ← Redis 事件循环主函数
+aeMain+564                  ← 事件循环主函数
 aeApiPoll.lto_priv.0+92     ← 事件 API 轮询
 epoll_pwait+36              ← 用户态 epoll_pwait 调用
 ```
@@ -828,9 +828,8 @@ ls /tmp/ebpf_reports/ | wc -l
 
 **步骤 2: 应用优化**
 ```bash
-# 例如: 启用 Redis I/O 多线程
-redis-cli CONFIG SET io-threads 4
-redis-cli CONFIG SET io-threads-do-reads yes
+# 例如: 调整应用配置以优化性能
+# 具体优化方式取决于目标进程类型
 ```
 
 **步骤 3: 收集优化后数据**
@@ -859,113 +858,7 @@ grep -A 20 "@cpu_stack" spike_after.txt | grep "^    " | sort | uniq -c
 
 ## 8. 实战案例
 
-### 8.1 案例 1: Valkey 单线程瓶颈
-
-**问题描述:**
-- 环境: AWS Graviton3 (m7g.4xlarge, 16 vCPU)
-- 现象: vCPU 0 持续 95%+，其他 vCPU < 10%
-- 影响: P99 延迟从 2ms 增加到 50ms
-
-**eBPF 采样结果:**
-```
-@cpu_stack[valkey-server, 
-    ep_poll+848
-    do_epoll_wait+236
-, 
-    aeApiPoll+92
-    aeMain+564
-]: 1485  (100% 采样)
-```
-
-**根因分析:**
-1. Valkey 默认单线程事件循环
-2. 所有 I/O 操作在 vCPU 0 上执行
-3. 其他 15 个 vCPU 空闲
-
-**优化方案:**
-```bash
-# 启用 I/O 多线程
-CONFIG SET io-threads 8
-CONFIG SET io-threads-do-reads yes
-```
-
-**优化效果:**
-| 指标 | 优化前 | 优化后 | 改善 |
-|------|--------|--------|------|
-| vCPU 0 使用率 | 95% | 42% | ↓ 56% |
-| 平均 CPU 使用率 | 12% | 38% | ↑ 217% |
-| P99 延迟 | 50ms | 3ms | ↓ 94% |
-| 吞吐量 | 45K ops/s | 180K ops/s | ↑ 300% |
-
-**eBPF 验证:**
-```bash
-# 优化后采样显示负载分散到多个 vCPU
-@cpu_stack[io-thread-1, ...]: 187
-@cpu_stack[io-thread-2, ...]: 183
-@cpu_stack[io-thread-3, ...]: 179
-...
-```
-
-### 8.2 案例 2: Predixy 内存分配热点
-
-**问题描述:**
-- 环境: AWS Graviton2 (m6g.2xlarge, 8 vCPU)
-- 现象: 间歇性 CPU 尖峰 (每 5-10 分钟)
-- 影响: 尖峰期间请求超时
-
-**eBPF 采样结果:**
-```
-@cpu_stack[predixy, 
-    do_anonymous_page+684
-    handle_pte_fault+528
-    handle_mm_fault+236
-    do_page_fault+368
-, 
-    malloc+124
-    std::allocator::allocate+48
-    std::vector::_M_realloc_insert+156
-    ConnectionPool::addConnection+92
-]: 892  (60% 采样)
-
-@cpu_stack[predixy,
-    folio_add_lru+100
-    lru_cache_add_inactive_or_unevictable+40
-,
-    je_arena_malloc+234
-    Request::parse+178
-]: 445  (30% 采样)
-```
-
-**根因分析:**
-1. 连接池动态扩容触发大量内存分配
-2. 频繁缺页中断 (page fault)
-3. jemalloc 默认配置不适合高并发场景
-
-**优化方案:**
-```bash
-# 1. 预分配连接池
-# predixy.conf
-ServerPool {
-    ...
-    Servers {
-        + 127.0.0.1:6379
-    }
-    InitPoolSize 100      # 预分配 100 个连接
-    MaxPoolSize 500       # 最大 500 个连接
-}
-
-# 2. 调整 jemalloc 参数
-export MALLOC_CONF="background_thread:true,metadata_thp:auto,dirty_decay_ms:5000,muzzy_decay_ms:5000"
-```
-
-**优化效果:**
-| 指标 | 优化前 | 优化后 | 改善 |
-|------|--------|--------|------|
-| 尖峰频率 | 8 次/小时 | 0.5 次/小时 | ↓ 94% |
-| 缺页中断 | 12K/s | 200/s | ↓ 98% |
-| 内存分配延迟 | 2.3ms | 0.1ms | ↓ 96% |
-
-### 8.3 案例 3: 容器 CPU 限流
+### 8.1 案例 1: 容器 CPU 限流
 
 **问题描述:**
 - 环境: Kubernetes (EKS on Graviton3)
@@ -974,7 +867,7 @@ export MALLOC_CONF="background_thread:true,metadata_thp:auto,dirty_decay_ms:5000
 
 **eBPF 采样结果:**
 ```
-@cpu_stack[valkey-server,
+@cpu_stack[my-server,
     cpu_cfs_period_timer+156
     __hrtimer_run_queues+284
     hrtimer_interrupt+248
@@ -1014,7 +907,7 @@ resources:
 | P99 延迟 | 120ms | 8ms | ↓ 93% |
 | 吞吐量 | 25K ops/s | 95K ops/s | ↑ 280% |
 
-### 8.4 案例 4: NUMA 亲和性问题
+### 8.2 案例 2: NUMA 亲和性问题
 
 **问题描述:**
 - 环境: 大型实例 (m7g.16xlarge, 64 vCPU, 2 NUMA 节点)
@@ -1023,7 +916,7 @@ resources:
 
 **eBPF 采样结果:**
 ```
-@cpu_stack[valkey-server,
+@cpu_stack[my-server,
     __alloc_pages+324
     alloc_pages_vma+156
     do_numa_page+448
@@ -1041,7 +934,7 @@ resources:
 **验证 NUMA 分布:**
 ```bash
 # 查看进程 NUMA 分布
-numastat -p $(pgrep valkey-server)
+numastat -p $(pgrep my-server)
                            Node 0          Node 1
                            --------------- ---------------
 Huge                                  0.00            0.00
@@ -1053,10 +946,10 @@ Private                             128.00          512.00
 **优化方案:**
 ```bash
 # 方案 1: 绑定到单个 NUMA 节点
-numactl --cpunodebind=0 --membind=0 valkey-server /etc/valkey.conf
+numactl --cpunodebind=0 --membind=0 my-server /etc/my-server.conf
 
 # 方案 2: 使用 CPU 亲和性
-taskset -c 0-31 valkey-server /etc/valkey.conf  # 绑定到前 32 个 vCPU
+taskset -c 0-31 my-server /etc/my-server.conf  # 绑定到前 32 个 vCPU
 ```
 
 **优化效果:**
@@ -1175,13 +1068,13 @@ sudo bpftrace -e 'BEGIN { printf("OK\n"); exit(); }'
 
 # 排查步骤
 # 1. 检查进程名是否正确
-ps aux | grep valkey-server
+ps aux | grep my-server
 
 # 2. 手动测试 bpftrace
-sudo bpftrace -e 'profile:hz:99 /comm == "valkey-server"/ { @[comm] = count(); }'
+sudo bpftrace -e 'profile:hz:99 /comm == "my-server"/ { @[comm] = count(); }'
 
 # 3. 检查符号表
-file /usr/bin/valkey-server  # 确保 not stripped
+file /usr/bin/my-server  # 确保 not stripped
 ```
 
 **问题 3: CPU 开销过高**
@@ -1226,7 +1119,7 @@ END {
 # 识别特征: epoll_wait, select, poll 占比高
 
 # 优化方向:
-- 启用多线程 I/O (Redis io-threads)
+- 启用多线程 I/O
 - 使用 io_uring (Linux 5.1+)
 - 调整 epoll 超时参数
 - 批量处理请求
@@ -1358,16 +1251,16 @@ sudo bpftool map list
 mpstat -P ALL 1
 
 # 查看进程 CPU 亲和性
-taskset -cp $(pgrep valkey-server)
+taskset -cp $(pgrep my-server)
 
 # 查看 NUMA 分布
-numastat -p $(pgrep valkey-server)
+numastat -p $(pgrep my-server)
 
 # 查看容器 CPU 限流
 cat /sys/fs/cgroup/cpu/cpu.stat
 
 # 手动触发采样
-sudo timeout 15s bpftrace -e 'profile:hz:99 /comm == "valkey-server"/ { @[kstack, ustack] = count(); }'
+sudo timeout 15s bpftrace -e 'profile:hz:99 /comm == "my-server"/ { @[kstack, ustack] = count(); }'
 ```
 
 ### 10.4 参考资料

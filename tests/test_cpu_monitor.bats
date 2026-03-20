@@ -110,7 +110,7 @@ load test_helper
     [[ "$result" == "90.0" ]]
 }
 
-@test "_bc normalization example: predixy 360 pct / 4 vCPU = 90.0" {
+@test "_bc normalization example: 360 pct / 4 vCPU = 90.0" {
     local raw_cpu=360
     local vcpu=4
     local result
@@ -118,7 +118,7 @@ load test_helper
     [[ "$result" == "90.0" ]]
 }
 
-@test "_bc normalization example: valkey 95 pct / 1 vCPU = 95.0" {
+@test "_bc normalization example: 95 pct / 1 vCPU = 95.0" {
     local raw_cpu=95
     local vcpu=1
     local result
