@@ -27,6 +27,7 @@ SAMPLE_FREQ=99                  # bpftrace 采样频率 (Hz)
 DROP_THRESHOLD=50               # CPU 降幅阈值 (%)
 MAX_SAMPLING_DURATION=60        # 最大采样时长 (秒)
 ATOP_INTERVAL=1                 # atop 采样间隔 (秒)
+TIMESERIES_BUCKET=1             # 时间序列分桶间隔 (秒)
 
 # === 报告管理 ===
 REPORT_DIR="/tmp/ebpf_reports"
@@ -607,7 +608,8 @@ should_trigger_sampling() {
 #   根据 TARGET_PROCS 生成 bpftrace 脚本
 #   - profile:hz:SAMPLE_FREQ 探针
 #   - comm 过滤（仅采样目标进程）
-#   - kstack + ustack 聚合计数
+#   - kstack + ustack 时间序列分桶统计
+#   - 每 TIMESERIES_BUCKET 秒输出一次时间戳 + 堆栈统计并清空
 #   输出: bpftrace 脚本文本到 stdout
 build_bpftrace_script() {
     local filter=""
@@ -630,8 +632,18 @@ build_bpftrace_script() {
 profile:hz:${SAMPLE_FREQ} /${filter}/ {
     @cpu_stack[comm, kstack, ustack] = count();
 }
-END {
+
+interval:s:${TIMESERIES_BUCKET} {
+    time("===BUCKET_START %Y-%m-%d %H:%M:%S===");
     print(@cpu_stack);
+    time("===BUCKET_END===");
+    clear(@cpu_stack);
+}
+
+END {
+    time("===BUCKET_START %Y-%m-%d %H:%M:%S===");
+    print(@cpu_stack);
+    time("===BUCKET_END===");
     clear(@cpu_stack);
 }
 EOF
@@ -1266,6 +1278,75 @@ get_top_functions() {
     return 0
 }
 
+# _print_per_bucket_top_functions BPFTRACE_FILE TOP_N
+#   将 bpftrace 时间序列输出按 BUCKET_START/END 分割，
+#   对每个时间桶独立调用 get_top_functions 输出 Top N 热点函数
+#   兼容无时间桶标记的旧格式（作为单个桶处理）
+#   参数: $1 = bpftrace 输出文件路径, $2 = Top N 数量
+#   输出: 按时间桶组织的热点函数列表到 stdout
+_print_per_bucket_top_functions() {
+    local bpftrace_file="$1"
+    local top_n="${2:-5}"
+    local bucket_num=0
+    local bucket_data=""
+    local bucket_ts=""
+    local has_buckets=false
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^===BUCKET_START\ (.*)===$ ]]; then
+            # 新桶开始：先输出上一个桶（如果有）
+            if [[ -n "$bucket_data" ]]; then
+                _output_bucket_top "$bucket_num" "$bucket_ts" "$bucket_data" "$top_n"
+            fi
+            bucket_num=$(( bucket_num + 1 ))
+            bucket_ts="${BASH_REMATCH[1]}"
+            bucket_data=""
+            has_buckets=true
+        elif [[ "$line" =~ ^===BUCKET_END===$ ]]; then
+            _output_bucket_top "$bucket_num" "$bucket_ts" "$bucket_data" "$top_n"
+            bucket_data=""
+            bucket_ts=""
+        else
+            if [[ -z "$bucket_data" ]]; then
+                bucket_data="$line"
+            else
+                bucket_data="${bucket_data}
+${line}"
+            fi
+        fi
+    done < "$bpftrace_file"
+
+    # 兼容旧格式：无时间桶标记时作为单个桶处理
+    if ! $has_buckets && [[ -n "$bucket_data" ]]; then
+        _output_bucket_top 1 "全采样窗口" "$bucket_data" "$top_n"
+    fi
+}
+
+# _output_bucket_top BUCKET_NUM TIMESTAMP BUCKET_DATA TOP_N
+#   输出单个时间桶的 Top N 热点函数
+_output_bucket_top() {
+    local num="$1"
+    local ts="$2"
+    local data="$3"
+    local n="$4"
+
+    echo "--- [${ts}] 桶 #${num} ---"
+    local top_output
+    top_output=$(get_top_functions "$data" "$n")
+    if [[ -n "$top_output" ]]; then
+        local rank=0
+        while IFS= read -r fline; do
+            rank=$(( rank + 1 ))
+            local count func pct
+            count=$(echo "$fline" | awk '{print $1}')
+            func=$(echo "$fline" | awk '{print $2}')
+            pct=$(echo "$fline" | awk '{print $3}')
+            echo "  ${rank}. ${func} (采样: ${count}, 占比: ${pct})"
+        done <<< "$top_output"
+    else
+        echo "  (该时间桶无堆栈数据)"
+    fi
+}
 
 # ============================================================================
 # 采集/报告占位函数（后续任务实现）
@@ -1588,22 +1669,30 @@ generate_report() {
         echo "基线文件:     ${baseline_file_ref:-不可用}"
         echo "================================================================================"
 
-        # ===== eBPF 堆栈统计 =====
+        # ===== eBPF 堆栈时间序列 =====
         echo ""
-        echo "=== eBPF 堆栈统计 (按出现次数降序) ==="
+        echo "=== eBPF 堆栈时间序列 (每 ${TIMESERIES_BUCKET}s 一个桶，桶内按出现次数降序) ==="
         local bpftrace_file="${sampling_dir}/bpftrace_output.txt"
         if [[ -r "$bpftrace_file" ]] && [[ -s "$bpftrace_file" ]]; then
-            # 解析 bpftrace 输出并按 count 降序排序
-            # bpftrace 输出格式: 堆栈块以 ]: count 结尾
-            # 策略: 将每个堆栈条目视为一个块，提取 count 值排序
             _sort_bpftrace_by_count "$bpftrace_file"
         else
             echo "eBPF 堆栈数据: 不可用 (bpftrace 输出文件为空或不可读)"
         fi
 
-        # ===== Top 热点函数 =====
+        # ===== 每桶 Top 热点函数 =====
         echo ""
-        echo "=== Top 热点函数 ==="
+        echo "=== 每桶 Top 热点函数 ==="
+        if [[ -r "$bpftrace_file" ]] && [[ -s "$bpftrace_file" ]]; then
+            if type -t get_top_functions &>/dev/null; then
+                _print_per_bucket_top_functions "$bpftrace_file" 5
+            fi
+        else
+            echo "热点函数: 不可用 (bpftrace 输出文件为空或不可读)"
+        fi
+
+        # ===== 全局 Top 热点函数（跨所有桶汇总）=====
+        echo ""
+        echo "=== 全局 Top 热点函数 (全采样窗口汇总) ==="
         if [[ -r "$bpftrace_file" ]] && [[ -s "$bpftrace_file" ]]; then
             if type -t get_top_functions &>/dev/null; then
                 local top_output
@@ -1698,56 +1787,22 @@ generate_report() {
 }
 
 # _sort_bpftrace_by_count BPFTRACE_FILE
-#   解析 bpftrace 输出并按 count 值降序排序输出
-#   bpftrace 聚合输出格式示例:
+#   解析 bpftrace 时间序列输出，按时间桶分组，每个桶内按 count 降序排序
+#   时间序列格式:
+#     ===BUCKET_START YYYY-MM-DD HH:MM:SS===
 #     @cpu_stack[comm, kstack, ustack]: count
-#   每个条目可能跨多行（堆栈帧），以 ]: <number> 结尾
+#     ...
+#     ===BUCKET_END===
+#   兼容旧版无时间桶的累计格式
 #   参数: $1 = bpftrace 输出文件路径
-#   输出: 排序后的堆栈数据到 stdout
+#   输出: 按时间桶组织、桶内按 count 降序排序的堆栈数据到 stdout
 _sort_bpftrace_by_count() {
     local bpftrace_file="$1"
 
-    # 使用 awk 解析 bpftrace 输出:
-    # - 收集每个堆栈块（从 @cpu_stack 开始到 ]: count 结束）
-    # - 提取 count 值
-    # - 按 count 降序排序输出
     awk '
-    BEGIN {
-        block = ""
-        count = 0
-        idx = 0
-    }
-    {
-        # 累积当前行到 block
-        if (block == "") {
-            block = $0
-        } else {
-            block = block "\n" $0
-        }
-
-        # 检查是否是块结尾（包含 ]: 数字）
-        if ($0 ~ /\]: *[0-9]+/) {
-            # 提取 count 值: 取 ]: 后面的数字
-            tmp = $0
-            sub(/.*\]: */, "", tmp)
-            sub(/[^0-9].*/, "", tmp)
-            count = tmp + 0
-            blocks[idx] = block
-            counts[idx] = count
-            idx++
-            block = ""
-            count = 0
-        }
-    }
-    END {
-        # 如果有未闭合的块，也输出
-        if (block != "") {
-            blocks[idx] = block
-            counts[idx] = 0
-            idx++
-        }
-
-        # 简单选择排序（按 count 降序）
+    function sort_and_print_bucket(    i, j, max_i, tmp_b, tmp_c) {
+        if (idx == 0) return
+        # 选择排序（按 count 降序）
         for (i = 0; i < idx - 1; i++) {
             max_i = i
             for (j = i + 1; j < idx; j++) {
@@ -1760,11 +1815,94 @@ _sort_bpftrace_by_count() {
                 tmp_c = counts[i]; counts[i] = counts[max_i]; counts[max_i] = tmp_c
             }
         }
-
-        # 输出排序后的块
         for (i = 0; i < idx; i++) {
             print blocks[i]
             if (i < idx - 1) print ""
+        }
+    }
+
+    BEGIN {
+        block = ""
+        idx = 0
+        in_bucket = 0
+        bucket_num = 0
+    }
+
+    /^===BUCKET_START / {
+        # 开始新的时间桶
+        bucket_num++
+        # 提取时间戳
+        ts = $0
+        sub(/^===BUCKET_START /, "", ts)
+        sub(/===$/, "", ts)
+        if (bucket_num > 1) print ""
+        print "--- [" ts "] 时间桶 #" bucket_num " ---"
+        in_bucket = 1
+        block = ""
+        idx = 0
+        delete blocks
+        delete counts
+        next
+    }
+
+    /^===BUCKET_END===/ {
+        # 结束当前桶，排序输出
+        if (block != "") {
+            blocks[idx] = block
+            counts[idx] = 0
+            idx++
+        }
+        sort_and_print_bucket()
+        in_bucket = 0
+        block = ""
+        idx = 0
+        delete blocks
+        delete counts
+        next
+    }
+
+    {
+        # 跳过桶外的空行（桶之间的空白）
+        if (!in_bucket && bucket_num > 0 && $0 ~ /^[[:space:]]*$/) next
+
+        # 累积当前行到 block
+        if (block == "") {
+            block = $0
+        } else {
+            block = block "\n" $0
+        }
+
+        # 检查是否是块结尾（包含 ]: 数字）
+        if ($0 ~ /\]: *[0-9]+/) {
+            tmp = $0
+            sub(/.*\]: */, "", tmp)
+            sub(/[^0-9].*/, "", tmp)
+            count = tmp + 0
+            blocks[idx] = block
+            counts[idx] = count
+            idx++
+            block = ""
+        }
+    }
+
+    END {
+        # 处理未闭合的残留数据（忽略纯空白残留）
+        gsub(/^[[:space:]]+$/, "", block)
+        if (block != "") {
+            blocks[idx] = block
+            counts[idx] = 0
+            idx++
+        }
+        if (idx > 0) {
+            if (bucket_num == 0) {
+                # 旧格式兼容：无时间桶标记，直接排序输出
+                sort_and_print_bucket()
+            } else {
+                # 有时间桶标记但最后一个桶未闭合（bpftrace 被中断）
+                print ""
+                print "--- [未闭合] 时间桶 #" (bucket_num + 1) " ---"
+                sort_and_print_bucket()
+            }
         }
     }
     ' "$bpftrace_file"
